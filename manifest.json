@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "FastRead",
+  "version": "0.1.0",
+  "description": "Read web pages aloud in a side panel, at any speed.",
+  "permissions": ["sidePanel", "scripting", "storage", "contextMenus"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "side_panel": { "default_path": "sidepanel.html" },
+  "action": { "default_title": "FastRead" },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": { "default": "Alt+Shift+R" },
+      "description": "Open FastRead"
+    },
+    "toggle-play": {
+      "suggested_key": { "default": "Alt+Shift+P" },
+      "description": "Play / pause"
+    },
+    "read-selection": {
+      "suggested_key": { "default": "Alt+Shift+S" },
+      "description": "Read selected text"
+    },
+    "faster": { "description": "Speed up" },
+    "slower": { "description": "Slow down" }
+  }
+}
