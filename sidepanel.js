@@ -18,7 +18,35 @@ for (let n = -3; n <= 10; n++) {
 const DEFAULT_SPEED = 6; // 2x
 const LIBS = ['lib/Readability.js', 'lib/defuddle.js', 'content/extract.js'];
 
-const settings = { speed: DEFAULT_SPEED, voiceName: '', fontSize: 17, theme: 'auto' };
+const AZ = globalThis.FastReadAzure;
+const AZURE_PREFIX = 'azure:';
+const AZURE_CHUNK = 600;   // max characters per Azure request (one block at most)
+const AZURE_AHEAD = 2;     // chunks synthesized ahead of the one playing
+const VOICE_CACHE_MS = 7 * 24 * 3600 * 1000;
+
+// voiceName is a local voice name, or "azure:<ShortName>" for an Azure neural voice.
+// speed indexes SPEEDS (local voices); azureSpeed indexes AZ.SPEEDS (Azure voices).
+const settings = { speed: DEFAULT_SPEED, azureSpeed: AZ.DEFAULT_SPEED, voiceName: '', fontSize: 17, theme: 'auto' };
+
+// Azure state. The key lives in its own storage entry (azureKey), never in `settings`, the DOM or logs.
+const azure = {
+  key: '',
+  region: '',
+  voices: [],          // normalized Azure voice list (cached in storage as azureVoices)
+  client: null,
+  usage: null,         // { month, chars, warned }
+  usageChain: Promise.resolve(),
+  down: null,          // AzureError that switched this panel to a local voice
+  fallbackVoice: null, // the local voice used while Azure is down
+  queue: new AZ.Prefetcher(),
+  audio: new Audio(),
+  url: '',
+  chunk: null,         // the chunk loaded in `audio`: { key, start, end, text, offsets, words }
+  first: false,        // next chunk is the first after play(): keep it to one sentence for a quick start
+  timer: 0,
+  lastWord: '',
+};
+azure.audio.preservesPitch = true;
 
 const state = {
   windowId: null,
@@ -45,9 +73,18 @@ function saveSettings() {
 
 function applySettings() {
   settings.speed = clampSpeed(settings.speed);
-  $('rate').max = SPEEDS.length - 1;
-  $('rate').value = settings.speed;
-  $('rateLabel').textContent = SPEEDS[settings.speed].label;
+  settings.azureSpeed = clampSpeed(settings.azureSpeed, AZ.SPEEDS.length, AZ.DEFAULT_SPEED);
+  if (usingAzure()) {
+    $('rate').max = AZ.SPEEDS.length - 1;
+    $('rate').value = settings.azureSpeed;
+    $('rateLabel').textContent = AZ.speedLabel(settings.azureSpeed);
+    $('rateLabel').title = AZ.speedTitle(settings.azureSpeed);
+  } else {
+    $('rate').max = SPEEDS.length - 1;
+    $('rate').value = settings.speed;
+    $('rateLabel').textContent = SPEEDS[settings.speed].label;
+    $('rateLabel').title = "Same scale as Chrome's Reading mode";
+  }
   $('fontSize').value = settings.fontSize;
   document.documentElement.style.setProperty('--font-size', `${settings.fontSize}px`);
   $('theme').value = settings.theme;
@@ -55,14 +92,23 @@ function applySettings() {
   else document.documentElement.dataset.theme = settings.theme;
 }
 
-function clampSpeed(i) {
+function clampSpeed(i, count = SPEEDS.length, fallback = DEFAULT_SPEED) {
   i = Math.round(Number(i));
-  if (!Number.isFinite(i)) i = DEFAULT_SPEED;
-  return Math.min(SPEEDS.length - 1, Math.max(0, i));
+  if (!Number.isFinite(i)) i = fallback;
+  return Math.min(count - 1, Math.max(0, i));
+}
+
+// Slider position for whichever voice type is active.
+function speedIndex() {
+  return usingAzure() ? settings.azureSpeed : settings.speed;
 }
 
 let rateRestart = null;
 function setSpeed(i) {
+  if (usingAzure()) {
+    setAzureSpeed(i);
+    return;
+  }
   const next = clampSpeed(i);
   if (next === settings.speed) return;
   settings.speed = next;
@@ -75,7 +121,40 @@ function setSpeed(i) {
   }
 }
 
+// Azure: same audio (prosody unchanged) just plays faster or slower; otherwise restart the sentence.
+function setAzureSpeed(i) {
+  const next = clampSpeed(i, AZ.SPEEDS.length, AZ.DEFAULT_SPEED);
+  if (next === settings.azureSpeed) return;
+  const before = AZ.speedParts(AZ.SPEEDS[settings.azureSpeed]);
+  settings.azureSpeed = next;
+  applySettings();
+  saveSettings();
+  if (!state.playing) return;
+  const after = AZ.speedParts(AZ.SPEEDS[next]);
+  if (Math.abs(after.prosody - before.prosody) < 0.005) {
+    azure.audio.defaultPlaybackRate = after.playback;
+    azure.audio.playbackRate = after.playback;
+    return;
+  }
+  clearTimeout(rateRestart);
+  rateRestart = setTimeout(() => state.playing && play(state.cur), 250);
+}
+
 // ---------- voices ----------
+
+const isAzureName = (name) => String(name || '').startsWith(AZURE_PREFIX);
+
+// The selected Azure voice, or null when a local voice is selected or no key is set.
+function azureVoice() {
+  if (!isAzureName(settings.voiceName) || !azure.key || !azure.region) return null;
+  const short = settings.voiceName.slice(AZURE_PREFIX.length);
+  return azure.voices.find((v) => v.ShortName === short) ||
+    { ShortName: short, Locale: short.split('-').slice(0, 2).join('-'), Gender: '' };
+}
+
+function usingAzure() {
+  return !!azureVoice() && !azure.down;
+}
 
 function loadVoices() {
   state.voices = speechSynthesis.getVoices();
@@ -83,19 +162,63 @@ function loadVoices() {
   sel.textContent = '';
   const sorted = state.voices.slice().sort((a, b) =>
     (b.localService - a.localService) || a.lang.localeCompare(b.lang) || a.name.localeCompare(b.name));
+  let localParent = sel;
+  if (azure.key && azure.voices.length) {
+    const g = document.createElement('optgroup');
+    g.label = 'Azure neural voices (online, uses your key)';
+    for (const v of azure.voices) {
+      const o = document.createElement('option');
+      o.value = AZURE_PREFIX + v.ShortName;
+      o.textContent = `${v.DisplayName} · ${v.Locale}${v.Gender ? ` · ${v.Gender}` : ''}`;
+      g.append(o);
+    }
+    sel.append(g);
+    localParent = document.createElement('optgroup');
+    localParent.label = 'Chrome and Windows voices';
+    sel.append(localParent);
+  }
   for (const v of sorted) {
     const o = document.createElement('option');
     o.value = v.name;
     o.textContent = `${v.name}${v.localService ? '' : ' (online)'}`;
-    sel.append(o);
+    localParent.append(o);
+  }
+  if (azureVoice() && [...sel.options].some((o) => o.value === settings.voiceName)) {
+    sel.value = settings.voiceName;
+    return;
   }
   const v = currentVoice();
   if (v) sel.value = v.name;
 }
 
+// Switching between local and Azure voices keeps the perceived speed (the two use different scales).
+function selectVoice(name) {
+  const wasAzure = usingAzure();
+  const natural = wasAzure ? AZ.SPEEDS[settings.azureSpeed] : AZ.windowsNatural(settings.speed);
+  settings.voiceName = name;
+  if (isAzureName(name)) {
+    azure.down = null; // picking an Azure voice again retries Azure
+    azure.fallbackVoice = null;
+    $('azureNotice').hidden = true;
+  }
+  const nowAzure = usingAzure();
+  if (nowAzure && !wasAzure) settings.azureSpeed = AZ.azureIndexFor(natural);
+  if (!nowAzure && wasAzure) settings.speed = AZ.windowsIndexFor(natural);
+  if (nowAzure !== wasAzure) applySettings();
+  saveSettings();
+  if (nowAzure) ensureSdk();
+  if (state.playing) play(state.cur);
+}
+
+// The voice for the speechSynthesis path. With an Azure voice selected, that's the local voice
+// standing in for it while Azure is down (matched by locale and gender).
 function currentVoice() {
   const vs = state.voices;
   if (!vs.length) return null;
+  if (isAzureName(settings.voiceName)) {
+    return azure.fallbackVoice ||
+      AZ.pickFallbackVoice(azureVoice() || { Locale: settings.voiceName.slice(AZURE_PREFIX.length, AZURE_PREFIX.length + 5) }, vs);
+  }
   return (
     vs.find((v) => v.name === settings.voiceName) ||
     vs.find((v) => v.default && v.localService) ||
@@ -206,6 +329,8 @@ function render(page) {
   state.page = page;
   state.sentences = [];
   state.cur = 0;
+  azureRelease();
+  azure.queue.clear(); // queued chunks are keyed by sentence index
   CSS.highlights.delete('fr-word');
   docEl.textContent = '';
   if (!page) {
@@ -289,6 +414,7 @@ function stop() {
   state.gen++;
   clearTimeout(rateRestart);
   speechSynthesis.cancel();
+  azurePause();
   setPlaying(false);
 }
 
@@ -297,6 +423,8 @@ function play(from = state.cur) {
   stop();
   state.cur = Math.max(0, Math.min(from, state.sentences.length - 1));
   setPlaying(true);
+  azure.first = true;
+  if (usingAzure() && azureResume(state.gen)) return;
   speakChunk(state.gen);
 }
 
@@ -327,6 +455,10 @@ function speakChunk(gen) {
     return;
   }
   state.ended = false;
+  if (usingAzure()) {
+    speakAzure(gen);
+    return;
+  }
   const voice = currentVoice();
   const maxChars = voice && !voice.localService ? 0 : 1200;
   const start = state.cur;
@@ -376,6 +508,344 @@ function speakChunk(gen) {
 
   state.cur = start;
   speechSynthesis.speak(u);
+}
+
+// ---------- Azure playback ----------
+// Each chunk (up to AZURE_CHUNK characters of one block) is synthesized to an MP3 and played in an
+// <audio> element; the next AZURE_AHEAD chunks are synthesized while it plays. Speed is SSML
+// <prosody rate> up to 2x, times audio.playbackRate (pitch preserved) for the rest.
+
+let sdkLoading = null;
+function ensureSdk() {
+  if (window.SpeechSDK) return Promise.resolve();
+  sdkLoading = sdkLoading || new Promise((resolve) => {
+    const s = document.createElement('script');
+    s.src = 'lib/speech-sdk.min.js';
+    s.onload = s.onerror = () => resolve(); // without the SDK the client uses REST
+    document.head.append(s);
+  });
+  return sdkLoading;
+}
+
+function azureClient() {
+  if (!azure.client) azure.client = AZ.createClient({ key: azure.key, region: azure.region });
+  return azure.client;
+}
+
+function resetAzureClient() {
+  if (azure.client) azure.client.close();
+  azure.client = null;
+  azure.queue.clear();
+}
+
+// End (exclusive) of the chunk starting at sentence `start`.
+function azureChunkEnd(start, first) {
+  const all = state.sentences;
+  let i = start;
+  let len = 0;
+  while (i < all.length && all[i].block === all[start].block &&
+    (i === start || (!first && len + all[i].text.length < AZURE_CHUNK))) {
+    len += all[i].text.length + 1;
+    i++;
+  }
+  return i;
+}
+
+function azureKey(start) {
+  const voice = azureVoice();
+  const { prosody } = AZ.speedParts(AZ.SPEEDS[settings.azureSpeed]);
+  return `${voice.ShortName}|${prosody}|${start}`;
+}
+
+// The queued chunk starting at sentence `start`, requesting it if needed.
+function azureChunk(start, first = false) {
+  const key = azureKey(start);
+  return azure.queue.get(key, () => {
+    const end = azureChunkEnd(start, first);
+    const offsets = [];
+    let text = '';
+    for (let i = start; i < end; i++) {
+      if (i > start) text += ' ';
+      offsets.push(text.length);
+      text += state.sentences[i].text;
+    }
+    const { ssml, billable } = AZ.buildSsml(text, azureVoice(), AZ.speedParts(AZ.SPEEDS[settings.azureSpeed]).prosody);
+    const job = ensureSdk()
+      .then(() => azureClient().synthesize(ssml))
+      .then((res) => {
+        countUsage(billable);
+        return res;
+      });
+    return { key, start, end, text, offsets, job };
+  });
+}
+
+// Keep the chunk at `entry` and the next AZURE_AHEAD chunks queued; drop the rest.
+function azurePrefetch(entry) {
+  const keys = [entry.key];
+  let s = entry.end;
+  for (let k = 0; k < AZURE_AHEAD && s < state.sentences.length; k++) {
+    const next = azureChunk(s);
+    keys.push(next.key);
+    s = next.end;
+  }
+  azure.queue.keepOnly(keys);
+}
+
+function speakAzure(gen) {
+  const entry = azureChunk(state.cur, azure.first);
+  azure.first = false;
+  azurePrefetch(entry);
+  markSentence(entry.start);
+  entry.job.then(
+    (res) => gen === state.gen && azurePlay(entry, res, gen),
+    (err) => gen === state.gen && azureFailed(err, gen),
+  );
+}
+
+function azurePlay(entry, res, gen) {
+  azureRelease();
+  const a = azure.audio;
+  azure.url = URL.createObjectURL(new Blob([res.audio], { type: res.type }));
+  azure.chunk = { ...entry, words: AZ.alignWords(res.words, entry.text) };
+  a.src = azure.url;
+  azureStart(gen, entry.start);
+}
+
+// (Re)attach handlers for this generation and play from the current position.
+function azureStart(gen, sentence) {
+  const a = azure.audio;
+  const c = azure.chunk;
+  const rate = AZ.speedParts(AZ.SPEEDS[settings.azureSpeed]).playback;
+  a.defaultPlaybackRate = rate; // loading a new src resets playbackRate to this
+  a.playbackRate = rate;
+  a.preservesPitch = true;
+  a.onended = () => {
+    if (gen !== state.gen) return;
+    azure.queue.drop(c.key);
+    state.cur = c.end;
+    speakChunk(gen);
+  };
+  a.onerror = () => {
+    if (gen !== state.gen) return;
+    setStatus('Could not play the Azure audio.', true);
+    setPlaying(false);
+  };
+  state.cur = sentence;
+  markSentence(sentence);
+  azure.lastWord = '';
+  a.play().catch((e) => {
+    if (gen !== state.gen || e.name === 'AbortError') return;
+    setStatus(`Playback blocked: ${e.message}`, true);
+    setPlaying(false);
+  });
+  clearInterval(azure.timer);
+  azure.timer = setInterval(() => azureTick(gen), 50);
+}
+
+// Resume the paused chunk if the reading position is inside it (no new request, no new
+// characters billed). Seeks when the position moved to another sentence of the chunk.
+function azureResume(gen) {
+  const c = azure.chunk;
+  if (!c || !azure.url || state.cur < c.start || state.cur >= c.end || c.key !== azureKey(c.start)) return false;
+  const a = azure.audio;
+  if (state.cur !== azure.pausedAt) {
+    const k = state.cur - c.start;
+    const w = c.words.find((x) => x.index >= c.offsets[k]);
+    if (w) a.currentTime = Math.max(0, w.t - 0.05);
+    else if (Number.isFinite(a.duration)) a.currentTime = (a.duration * c.offsets[k]) / c.text.length;
+    else return false;
+  }
+  azurePrefetch(c);
+  azureStart(gen, state.cur);
+  return true;
+}
+
+// Move the sentence and word highlights along with the audio.
+function azureTick(gen) {
+  const c = azure.chunk;
+  const a = azure.audio;
+  if (gen !== state.gen || !c) return;
+  const t = a.currentTime;
+  let index;
+  let length = 0;
+  if (c.words.length) {
+    let k = -1;
+    while (k + 1 < c.words.length && c.words[k + 1].t <= t) k++;
+    if (k === -1) return;
+    ({ index, length } = c.words[k]);
+  } else {
+    // REST audio has no word timings: estimate the sentence from the time played.
+    if (!Number.isFinite(a.duration) || !a.duration) return;
+    index = Math.floor((c.text.length * t) / a.duration);
+  }
+  let k = c.offsets.length - 1;
+  while (k > 0 && c.offsets[k] > index) k--;
+  const si = c.start + k;
+  if (si !== state.cur) {
+    state.cur = si;
+    markSentence(si);
+  }
+  const mark = `${si}:${index}`;
+  if (length && mark !== azure.lastWord) {
+    azure.lastWord = mark;
+    markWord(si, index - c.offsets[k], length);
+  }
+}
+
+function azurePause() {
+  clearInterval(azure.timer);
+  const a = azure.audio;
+  a.onended = null;
+  a.onerror = null;
+  if (!a.paused) a.pause();
+  azure.pausedAt = state.cur;
+}
+
+function azureRelease() {
+  azurePause();
+  const a = azure.audio;
+  if (azure.url) {
+    a.removeAttribute('src');
+    a.load();
+    URL.revokeObjectURL(azure.url);
+  }
+  azure.url = '';
+  azure.chunk = null;
+}
+
+// Azure failed (key rejected, quota used up, unreachable): switch to the matching local voice and
+// keep reading from the same sentence.
+function azureFailed(err, gen) {
+  const fallback = AZ.pickFallbackVoice(azureVoice(), state.voices);
+  azure.down = err;
+  azure.fallbackVoice = fallback;
+  azureRelease();
+  azure.queue.clear();
+  settings.speed = AZ.windowsIndexFor(AZ.SPEEDS[settings.azureSpeed]); // same perceived speed
+  applySettings();
+  saveSettings();
+  showAzureNotice(AZ.noticeFor(err, fallback && fallback.name), true);
+  speakChunk(gen);
+}
+
+function retryAzure() {
+  if (!azure.down) return;
+  azure.down = null;
+  azure.fallbackVoice = null;
+  settings.azureSpeed = AZ.azureIndexFor(AZ.windowsNatural(settings.speed));
+  applySettings();
+  saveSettings();
+  $('azureNotice').hidden = true;
+  if (state.playing) play(state.cur);
+}
+
+function showAzureNotice(text, canRetry = false) {
+  $('azureNoticeText').textContent = text;
+  $('azureRetry').hidden = !canRetry;
+  $('azureNotice').hidden = false;
+}
+
+// ---------- Azure settings and usage ----------
+
+function setAzureStatus(msg, isError = false) {
+  const el = $('azureStatus');
+  el.textContent = msg || '';
+  el.classList.toggle('error', !!isError);
+}
+
+function showUsage() {
+  $('azureUsage').textContent = azure.key || (azure.usage && azure.usage.chars) ? AZ.formatUsage(azure.usage) : '';
+}
+
+// Count billable characters per calendar month; warn once a month at 80% of the free tier.
+function countUsage(chars) {
+  azure.usageChain = azure.usageChain.then(async () => {
+    const { azureUsage } = await chrome.storage.local.get('azureUsage');
+    const { usage, warn } = AZ.addUsage(azureUsage, chars);
+    azure.usage = usage;
+    await chrome.storage.local.set({ azureUsage: usage });
+    showUsage();
+    if (warn) {
+      showAzureNotice(`Azure usage: ${Math.round(usage.chars / 1000)}k of your 500k free characters this month. ` +
+        'If Azure starts refusing requests, FastRead switches to a Windows voice.');
+    }
+  }).catch(() => {});
+}
+
+async function loadAzure() {
+  const got = await chrome.storage.local.get(['azureKey', 'azureRegion', 'azureUsage', 'azureVoices']);
+  azure.key = got.azureKey || '';
+  azure.region = got.azureRegion || '';
+  azure.usage = got.azureUsage || null;
+  $('azureRegion').value = azure.region;
+  $('azureKey').placeholder = azure.key ? 'Key saved (hidden). Paste a new one to replace it.' : 'Paste your Speech key';
+  $('azureForget').hidden = !azure.key;
+  const cache = got.azureVoices;
+  if (cache && cache.region === azure.region && Date.now() - cache.at < VOICE_CACHE_MS) azure.voices = cache.voices;
+  else if (azure.key && azure.region) refreshAzureVoices();
+  showUsage();
+}
+
+async function refreshAzureVoices() {
+  setAzureStatus('Loading Azure voices…');
+  try {
+    const voices = await azureClient().listVoices();
+    azure.voices = voices;
+    await chrome.storage.local.set({ azureVoices: { region: azure.region, at: Date.now(), voices } });
+    setAzureStatus(`${voices.length} Azure voices loaded. Pick one in the Voice list.`);
+    loadVoices();
+    applySettings();
+  } catch (e) {
+    const msg = e.kind === 'auth' ? `Azure rejected the key for region "${azure.region}" (HTTP ${e.status}).`
+      : e.kind === 'network' ? 'Could not reach Azure. Check the region name and your connection.'
+        : `Could not load Azure voices (${e.message}).`;
+    setAzureStatus(msg, true);
+  }
+}
+
+async function saveAzure() {
+  const key = $('azureKey').value.trim();
+  const region = $('azureRegion').value.trim().toLowerCase();
+  if (!/^[a-z0-9]+$/.test(region)) {
+    setAzureStatus('Enter the region shown next to your key, for example eastus or westeurope.', true);
+    return;
+  }
+  if (key && !/^[A-Za-z0-9]{16,128}$/.test(key)) {
+    setAzureStatus('That does not look like a Speech key (letters and digits only).', true);
+    return;
+  }
+  if (!key && !azure.key) {
+    setAzureStatus('Paste your key first.', true);
+    return;
+  }
+  stop();
+  if (key) azure.key = key;
+  azure.region = region;
+  $('azureKey').value = '';
+  $('azureKey').placeholder = 'Key saved (hidden). Paste a new one to replace it.';
+  $('azureForget').hidden = false;
+  await chrome.storage.local.set({ azureKey: azure.key, azureRegion: azure.region });
+  resetAzureClient();
+  azure.down = null;
+  azure.fallbackVoice = null;
+  await refreshAzureVoices();
+}
+
+async function forgetAzure() {
+  stop();
+  const wasAzure = usingAzure();
+  await chrome.storage.local.remove(['azureKey', 'azureVoices']);
+  azure.key = '';
+  azure.voices = [];
+  resetAzureClient();
+  if (wasAzure) settings.speed = AZ.windowsIndexFor(AZ.SPEEDS[settings.azureSpeed]);
+  $('azureKey').placeholder = 'Paste your Speech key';
+  $('azureForget').hidden = true;
+  setAzureStatus('Key removed from this browser.');
+  loadVoices();
+  applySettings();
+  showUsage();
 }
 
 // ---------- picker ----------
@@ -431,8 +901,8 @@ function connect() {
 function handleCommand(msg) {
   if (!msg) return;
   if (msg.type === 'toggle') togglePlay();
-  else if (msg.type === 'faster') setSpeed(settings.speed + 1);
-  else if (msg.type === 'slower') setSpeed(settings.speed - 1);
+  else if (msg.type === 'faster') setSpeed(speedIndex() + 1);
+  else if (msg.type === 'slower') setSpeed(speedIndex() - 1);
   else if (msg.type === 'selection') loadSelection(msg.tabId, msg.text);
   else if (msg.type === 'page') loadPage({ autoplay: !!msg.autoplay });
 }
@@ -451,8 +921,8 @@ function wire() {
   $('play').onclick = togglePlay;
   $('prev').onclick = () => skip(-1);
   $('next').onclick = () => skip(1);
-  $('slower').onclick = () => setSpeed(settings.speed - 1);
-  $('faster').onclick = () => setSpeed(settings.speed + 1);
+  $('slower').onclick = () => setSpeed(speedIndex() - 1);
+  $('faster').onclick = () => setSpeed(speedIndex() + 1);
   $('rate').oninput = (e) => setSpeed(e.target.value);
   $('reload').onclick = () => loadPage();
   $('pick').onclick = startPicker;
@@ -462,11 +932,12 @@ function wire() {
     s.hidden = !s.hidden;
     $('settingsBtn').setAttribute('aria-expanded', String(!s.hidden));
   };
-  $('voice').onchange = (e) => {
-    settings.voiceName = e.target.value;
-    saveSettings();
-    if (state.playing) play(state.cur);
-  };
+  $('voice').onchange = (e) => selectVoice(e.target.value);
+  $('azureSave').onclick = saveAzure;
+  $('azureForget').onclick = forgetAzure;
+  $('azureKey').addEventListener('keydown', (e) => e.key === 'Enter' && saveAzure());
+  $('azureRetry').onclick = retryAzure;
+  $('azureNoticeClose').onclick = () => { $('azureNotice').hidden = true; };
   $('fontSize').oninput = (e) => {
     settings.fontSize = Number(e.target.value);
     applySettings();
@@ -491,8 +962,8 @@ function wire() {
     if (e.key === ' ' || e.key === 'k') togglePlay();
     else if (e.key === 'ArrowLeft') skip(-1);
     else if (e.key === 'ArrowRight') skip(1);
-    else if (e.key === '-' || e.key === '_') setSpeed(settings.speed - 1);
-    else if (e.key === '=' || e.key === '+') setSpeed(settings.speed + 1);
+    else if (e.key === '-' || e.key === '_') setSpeed(speedIndex() - 1);
+    else if (e.key === '=' || e.key === '+') setSpeed(speedIndex() + 1);
     else return;
     e.preventDefault();
   });
@@ -524,7 +995,9 @@ async function init() {
   speechSynthesis.cancel();
   const win = await chrome.windows.getCurrent();
   state.windowId = win.id;
+  await loadAzure();
   await loadSettings();
+  if (usingAzure()) ensureSdk();
   loadVoices();
   wire();
   connect();

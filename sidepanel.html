@@ -59,7 +59,49 @@
       </select>
     </label>
     <p class="hint">Speeds use the same scale as Chrome's Reading mode, so 2× here sounds like 2× there. With Windows voices (Microsoft David, Zira, Mark) the top speed, 10×, is about 3 times normal talking speed. Online voices may not speed up past 2×.</p>
+
+    <fieldset class="azure">
+      <legend>Azure neural voices (optional)</legend>
+      <label>Speech key
+        <input id="azureKey" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your Speech key">
+      </label>
+      <label>Region
+        <input id="azureRegion" list="azureRegions" autocomplete="off" spellcheck="false" placeholder="eastus">
+      </label>
+      <datalist id="azureRegions">
+        <option value="eastus"></option>
+        <option value="eastus2"></option>
+        <option value="westus"></option>
+        <option value="westus2"></option>
+        <option value="centralus"></option>
+        <option value="canadacentral"></option>
+        <option value="uksouth"></option>
+        <option value="westeurope"></option>
+        <option value="northeurope"></option>
+        <option value="francecentral"></option>
+        <option value="germanywestcentral"></option>
+        <option value="southafricanorth"></option>
+        <option value="centralindia"></option>
+        <option value="southeastasia"></option>
+        <option value="eastasia"></option>
+        <option value="japaneast"></option>
+        <option value="australiaeast"></option>
+      </datalist>
+      <div class="row">
+        <button id="azureSave" class="btn">Save and load voices</button>
+        <button id="azureForget" class="link" hidden>Remove key</button>
+      </div>
+      <p id="azureStatus" class="hint" role="status"></p>
+      <p id="azureUsage" class="hint"></p>
+      <p class="hint">The key is stored only in this browser. Page text goes to Microsoft Azure only while an Azure voice is selected. Azure speeds are multiples of the voice's normal pace (up to 6×; 3× is about the fastest Windows voice).</p>
+    </fieldset>
   </section>
+
+  <div id="azureNotice" class="notice" hidden>
+    <span id="azureNoticeText"></span>
+    <button id="azureRetry" class="link" hidden>Try Azure again</button>
+    <button id="azureNoticeClose" class="link">Dismiss</button>
+  </div>
 
   <div id="stale" class="notice" hidden>
     Page changed. <button id="staleLoad" class="link">Load new page</button>
@@ -73,6 +115,7 @@
     <span id="progress"></span>
   </footer>
 
+  <script src="azure.js"></script>
   <script src="sidepanel.js"></script>
 </body>
 </html>
