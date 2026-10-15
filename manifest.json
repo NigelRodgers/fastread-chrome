@@ -1,27 +1,60 @@
 {
   "manifest_version": 3,
   "name": "FastRead",
-  "version": "0.1.0",
-  "description": "Read web pages aloud in a side panel, at any speed.",
-  "permissions": ["sidePanel", "scripting", "storage", "contextMenus"],
-  "host_permissions": ["<all_urls>"],
-  "background": { "service_worker": "background.js" },
-  "side_panel": { "default_path": "sidepanel.html" },
-  "action": { "default_title": "FastRead" },
+  "version": "0.2.0",
+  "description": "Read web pages aloud in a side panel, past Reading mode's 2x cap, with Windows or Azure neural voices.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "sidePanel",
+    "scripting",
+    "storage",
+    "contextMenus"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "action": {
+    "default_title": "FastRead",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
+    }
+  },
   "commands": {
     "_execute_action": {
-      "suggested_key": { "default": "Alt+Shift+R" },
+      "suggested_key": {
+        "default": "Alt+Shift+R"
+      },
       "description": "Open FastRead"
     },
     "toggle-play": {
-      "suggested_key": { "default": "Alt+Shift+P" },
+      "suggested_key": {
+        "default": "Alt+Shift+P"
+      },
       "description": "Play / pause"
     },
     "read-selection": {
-      "suggested_key": { "default": "Alt+Shift+S" },
+      "suggested_key": {
+        "default": "Alt+Shift+S"
+      },
       "description": "Read selected text"
     },
-    "faster": { "description": "Speed up" },
-    "slower": { "description": "Slow down" }
+    "faster": {
+      "description": "Speed up"
+    },
+    "slower": {
+      "description": "Slow down"
+    }
   }
 }

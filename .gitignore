@@ -1,2 +1,13 @@
+# Vendored sources, node modules and Playwright browsers (see README > Tests)
 .vendor-src/
 node_modules/
+
+# Browser profiles and output from local test runs
+test-profile*/
+test/profiles/
+*.log
+
+# Local secrets, never commit
+.env
+.env.*
+*.key
